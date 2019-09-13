@@ -1,71 +1,91 @@
-# Sequence Generation Model for Multi-label Classification
-- This is the code for our paper *SGM: Sequence Generation Model for Multi-label Classification* [[pdf]](https://arxiv.org/abs/1806.04822)
-- Be careful: the provided code is based on the RCV1-V2 dataset. If you need to run the code on other datasets, please correspondly modify all program statements that relate to the specific name of the dataset.
+# Multi-label Classification (Pytorch)
+- Repo for MLC (Multi-label Classification) models.
 
-***********************************************************
 
-## Datasets
+## Support [Datasets](https://drive.google.com/file/d/18-JOCIj9v5bZCrn9CIsk23W4wyhroCp_/view?usp=sharing)
 * RCV1-V2
 * AAPD
 
-Two datasets are available at https://drive.google.com/file/d/18-JOCIj9v5bZCrn9CIsk23W4wyhroCp_/view?usp=sharing
-
-***************************************************************
+## Support Models
+* NMT
+* SGM (TODO)
+* ...
 
 ## Requirements
-* Ubuntu 16.0.4
-* Python 3.5
-* Pytorch 0.3.1
-
-***************************************************************
-
-## Reproducibility
-We provide the pretrained checkpoints of the SGM model and the SGM+GE model on the RCV1-V2 dataset to help you to reproduce our reported experimental results. The detailed reproduction steps are as follows:
-
-- Please download the RCV1-V2 dataset and checkpoints first by clicking on the link provided above, then put them in the folder *./data/data/*
-- Preprocessing: ```python3 preprocess.py ```
-- Predict: ```python3 predict.py -gpus id -log log_name```
-
-***************************************************************
-
-## Preprocessing
+* Python 3.6 +
+* Pytorch 1.0.0 +
+* requirements.txt
+* Folder organization
 ```
-python3 preprocess.py 
+MLC
+│   README.md
+│   embeddings.py
+│   model.py
+│   run.py
+│   utils.py
+│   vocab.py
+│   requirements.txt
+│   
+└───data
+│   └───AAPD
+│   │    │   aapd.json
+│   │    │   label_test
+│   │    │   label_train
+│   │    │   label_val
+│   │    │   text_test
+│   │    │   text_train
+│   │    │   text_val
+│   │    
+│   └───RCV1-V2
+│        │   same as AAPD
+│       
+└───checkpoints
+│   └───AAPD
+│   │    │   model.bin
+│   │    │   model.bin.optim
+│   │
+│   │    
+│   └───RCV1-V2
+│        │   same as AAPD
+│        
+└───outputs
+    └───AAPD
+    │    │   test_outputs.txt
+    │
+    │    
+    └───RCV1-V2
+         │   same as AAPD
+    
 ```
-Remember to download the dataset and put them in the folder *./data/data/*
 
-***************************************************************
+## Building Vocablary
+```
+python vocab.py -train-src=<file> -train-tgt=<file> [options]
+
+Options:
+    -train_src=<file>         File of training source sentences
+    -train_tgt=<file>         File of training target sentences
+    -size=<int>               vocab size [default: 50000]
+    -freq_cutoff=<int>        frequency cutoff [default: 2]
+    -vocab_file=<file>        File of saving vocabulary
+```
 
 ## Training
 ```
-python3 train.py -gpus id -log log_name
-```
+python run.py -mode=train -train_src=<file> -train_tgt=<file> -dev_src=<file> -dev_tgt=<file> -vocab=<file> [options]
 
-****************************************************************
+Options:
+    -mode=<src>                             train or test model [default: train]
+    -cuda=<int>                             use which gpu, negative integer for cpu [default: 0]
+    -train_src=<file>                       train source file
+    -train_tgt=<file>                       train target file
+    ...
+# for full options, refer to run.py
+```
 
 ## Evaluation
 ```
-python3 predict.py -gpus id -restore checkpoint -log log_name
-```
-
-*******************************************************************
-
-## Citation
-If you use the above code or the AAPD dataset for your research, please cite the paper:
-
-```
-@inproceedings{YangCOLING2018,
-  author    = {Pengcheng Yang and
-               Xu Sun and
-               Wei Li and
-               Shuming Ma and
-               Wei Wu and
-               Houfeng Wang},
-  title     = {{SGM:} Sequence Generation Model for Multi-label Classification},
-  booktitle = {Proceedings of the 27th International Conference on Computational
-               Linguistics, {COLING} 2018, Santa Fe, New Mexico, USA, August 20-26,
-               2018},
-  pages     = {3915--3926},
-  year      = {2018}
-}
+python run.py -mode=test  -test_src=<file>  [options]
+Options:
+    same as above
 ```
