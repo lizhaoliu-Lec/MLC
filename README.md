@@ -58,7 +58,7 @@ MLC
     
 ```
 
-## Building Vocablary
+## Building Vocabulary
 ```
 python vocab.py -train-src=<file> -train-tgt=<file> [options]
 
