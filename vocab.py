@@ -3,7 +3,7 @@
 
 """
 Usage:
-    vocab.py -train-src=<file> -train-tgt=<file> [options] VOCAB_FILE
+    vocab.py -train-src=<file> -train-tgt=<file> [options]
 
 Options:
     -train_src=<file>         File of training source sentences
