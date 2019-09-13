@@ -63,7 +63,7 @@ def read_corpus(file_path, source, sep=' ', border='\n'):
 def batch_iter(data,
                batch_size,
                shuffle=False,
-               shuffle_target=True):
+               shuffle_target=False):
     """ Yield batches of source and target sentences reverse sorted by length (largest to smallest).
     @param data: (list of (src_sent, tgt_sent)), list of tuples containing source and target sentence
     @param batch_size: (int), batch size

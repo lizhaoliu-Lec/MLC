@@ -7,7 +7,9 @@ Usage:
     run.py -mode=test  -test_src=<file>  [options]
 
 Options:
-    -mode=<src>                             train or test model [default: train]
+    -model_name=<str>                       specify the model [default: SGM]
+    -dataset_name=<str>                     specify the dataset [default: AAPD]
+    -mode=<str>                             train or test model [default: train]
     -cuda=<int>                             use which gpu, negative integer for cpu [default: 0]
     -train_src=<file>                       train source file
     -train_tgt=<file>                       train target file
@@ -41,7 +43,7 @@ import argparse
 
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 from sklearn import metrics
-from model import Hypothesis, NMT
+from model import Hypothesis, get_model
 import numpy as np
 from typing import List, Tuple, Dict, Set, Union
 from tqdm import tqdm
@@ -55,34 +57,39 @@ import torch.nn.utils
 def parse_args():
     parser = argparse.ArgumentParser(description='run.py for training, evaluating model')
 
+    parser.add_argument('-model_name', default='SGM', type=str,
+                        help="choose the model by name")
+    parser.add_argument('-dataset_name', default='AAPD', type=str,
+                        help="choose the dataset by name")
+
     parser.add_argument('-mode', default='test', type=str,
                         help="choose mode from train or test")
 
     parser.add_argument('-cuda', default=1, type=int,
                         help="Use cuda for training and evaluating model, negative int will use cpu instead")
 
-    parser.add_argument('-train_src', default='./data/AAPD/text_train', type=str,
+    parser.add_argument('-train_src', default='./data/%s/text_train', type=str,
                         help="File of training target sentences")
-    parser.add_argument('-train_tgt', default='./data/AAPD/label_train', type=str,
+    parser.add_argument('-train_tgt', default='./data/%s/label_train', type=str,
                         help="File of training target sentences (label)")
-    parser.add_argument('-dev_src', default='./data/AAPD/text_val', type=str,
+    parser.add_argument('-dev_src', default='./data/%s/text_val', type=str,
                         help="File of validating target sentences")
-    parser.add_argument('-dev_tgt', default='./data/AAPD/label_val', type=str,
+    parser.add_argument('-dev_tgt', default='./data/%s/label_val', type=str,
                         help="File of validating target sentences (label)")
-    parser.add_argument('-test_src', default='./data/AAPD/text_test', type=str,
+    parser.add_argument('-test_src', default='./data/%s/text_test', type=str,
                         help="File of validating target sentences")
-    parser.add_argument('-test_tgt', default='./data/AAPD/label_test', type=str,
+    parser.add_argument('-test_tgt', default='./data/%s/label_test', type=str,
                         help="File of validating target sentences (label)")
 
-    parser.add_argument('-vocab', default='./data/AAPD/vocab.json', type=str,
+    parser.add_argument('-vocab', default='./data/%s/vocab.json', type=str,
                         help="File of vocabulary")
-    parser.add_argument('-output_file', default='./outputs/AAPD/test_outputs.txt', type=str,
+    parser.add_argument('-output_file', default='./outputs/%s/%s/test_outputs.txt', type=str,
                         help="File of vocabulary")
 
     parser.add_argument('-seed', default=0, type=int,
                         help="seed, default 0")
-    parser.add_argument('-batch_size', default=32, type=int,
-                        help="batch_size, default 32")
+    parser.add_argument('-batch_size', default=128, type=int,
+                        help="batch_size, default 128")
     parser.add_argument('-embed_size', default=256, type=int,
                         help="embed_size, default 256")
     parser.add_argument('-hidden_size', default=256, type=int,
@@ -105,7 +112,7 @@ def parse_args():
                         help="learning rate, default 0.001")
     parser.add_argument('-uniform_init', default=0.1, type=float,
                         help="uniformly initialize all parameters, default 0.1")
-    parser.add_argument('-save_to', default='./checkpoints/AAPD/model.bin', type=str,
+    parser.add_argument('-save_to', default='./checkpoints/%s/%s/model.bin', type=str,
                         help="model save path, default ./checkpoints/model.bin")
     parser.add_argument('-valid_niter', default=2000, type=int,
                         help="perform validation after how many iterations, default: 2000")
@@ -213,11 +220,13 @@ def train(args):
     """ Train the NMT Model.
     @param args, args from cmd line
     """
-    train_data_src = read_corpus(args.train_src, source='src')
-    train_data_tgt = read_corpus(args.train_tgt, source='tgt')
+    model_name = args.model_name
+    dataset_name = args.dataset_name
+    train_data_src = read_corpus(args.train_src % dataset_name, source='src')
+    train_data_tgt = read_corpus(args.train_tgt % dataset_name, source='tgt')
 
-    dev_data_src = read_corpus(args.dev_src, source='src')
-    dev_data_tgt = read_corpus(args.dev_tgt, source='tgt')
+    dev_data_src = read_corpus(args.dev_src % dataset_name, source='src')
+    dev_data_tgt = read_corpus(args.dev_tgt % dataset_name, source='tgt')
 
     train_data = list(zip(train_data_src, train_data_tgt))
     dev_data = list(zip(dev_data_src, dev_data_tgt))
@@ -226,14 +235,14 @@ def train(args):
     clip_grad = args.clip_grad
     valid_niter = args.valid_niter
     log_every = args.log_every
-    model_save_path = args.save_to
+    model_save_path = args.save_to % (model_name, dataset_name)
 
-    vocab = Vocab.load(args.vocab)
+    vocab = Vocab.load(args.vocab % dataset_name)
 
-    model = NMT(embed_size=args.embed_size,
-                hidden_size=args.hidden_size,
-                dropout_rate=args.dropout,
-                vocab=vocab)
+    model = get_model(model_name)(embed_size=args.embed_size,
+                                  hidden_size=args.hidden_size,
+                                  dropout_rate=args.dropout,
+                                  vocab=vocab)
     model.train()
 
     uniform_init = args.uniform_init
@@ -294,7 +303,7 @@ def train(args):
             cum_examples += batch_size
 
             if train_iter % log_every == 0:
-                print('epoch: [%d] | iter: [%d] | avg. loss: [%.2f] | avg. ppl: [%.2f] |'
+                print('epoch: [%d] | iter: [%d] | avg. loss: [%.2f] | avg. ppl: [%.2f] | '
                       'cum. examples: [%d] | speed: [%.2f words/sec] | time elapsed: [%.2f sec]' % (
                           epoch, train_iter,
                           report_loss / report_examples,
@@ -384,14 +393,17 @@ def decode(args):
     @param args: args from cmd line
     """
 
-    print("load test source sentences from [{}]".format(args.test_src), file=sys.stderr)
-    test_data_src = read_corpus(args.test_src, source='src')
-    if args.test_tgt:
-        print("load test target sentences from [{}]".format(args.test_tgt), file=sys.stderr)
-        test_data_tgt = read_corpus(args.test_tgt, source='tgt')
+    model_name = args.model_name
+    dataset_name = args.dataset_name
 
-    print("load model from {}".format(args.save_to), file=sys.stderr)
-    model = NMT.load(args.save_to)
+    print("load test source sentences from [{}]".format(args.test_src % dataset_name), file=sys.stderr)
+    test_data_src = read_corpus(args.test_src % dataset_name, source='src')
+    if args.test_tgt:
+        print("load test target sentences from [{}]".format(args.test_tgt % dataset_name), file=sys.stderr)
+        test_data_tgt = read_corpus(args.test_tgt % dataset_name, source='tgt')
+
+    print("load model from {}".format(args.save_to % (model_name, dataset_name)), file=sys.stderr)
+    model = get_model(model_name).load(args.save_to % (model_name, dataset_name))
 
     if args.cuda >= 0:
         model = model.to(torch.device("cuda:%d" % args.cuda))
@@ -408,7 +420,7 @@ def decode(args):
         for result, val in results.items():
             print('%s: %.4f' % (result, val), file=sys.stderr)
 
-    with open(args.output_file, 'w') as f:
+    with open(args.output_file % (model_name, dataset_name), 'w') as f:
         for src_sent, hyps in zip(test_data_src, hypotheses):
             top_hyp = hyps[0]
             hyp_sent = ' '.join(top_hyp.value)
@@ -416,7 +428,7 @@ def decode(args):
     pass
 
 
-def beam_search(model: NMT,
+def beam_search(model,
                 test_data_src: List[List[str]],
                 beam_size: int,
                 max_decoding_time_step: int) -> List[List[Hypothesis]]:
@@ -451,6 +463,8 @@ def main():
 
     # Check pytorch version
     assert torch.__version__ >= "1.0.0", "Expect pytorch version higher than 1.0.0, but got".format(torch.__version__)
+    print('*** Using model: `%s` in mode: `%s` ***' % (args.model_name, args.mode))
+    print('*** Using dataset: `%s` ***' % args.dataset_name)
 
     # seed the random number generators
     seed = args.seed

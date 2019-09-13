@@ -8,7 +8,7 @@
 
 ## Support Models
 * NMT
-* SGM (TODO)
+* SGM (variant)
 * ...
 
 ## Requirements
