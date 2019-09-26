@@ -7,6 +7,8 @@ model.py: NMT model
 from collections import namedtuple
 import sys
 from typing import List, Tuple
+import numpy as np
+from sklearn import metrics
 import torch
 import torch.nn as nn
 import torch.nn.utils
@@ -18,6 +20,60 @@ from embeddings import Embeddings
 Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, alpha=None, size_average=False):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        if alpha is None:
+            self.alpha = None
+        elif isinstance(alpha, (float, int)):
+            self.alpha = torch.tensor([alpha, 1 - alpha])
+        elif isinstance(alpha, list):
+            if len(alpha) != 2:
+                raise ValueError('expect alpha to be a list of 2 element, but got `%d`' % len(alpha))
+            self.alpha = torch.tensor(alpha)
+        else:
+            raise ValueError('expect alpha to be a float, int or list, but got `%s`' % type(alpha))
+        self.size_average = size_average
+
+    def forward(self, predict: torch.Tensor,
+                target: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+
+        batch_size = predict.size(1)
+        length = predict.size(0)
+
+        # predict: (len, b, tgt_vocab_size)
+        # target: (len, b)
+        # mask: (len, b)
+
+        # log_prob: (len, b, tgt_vocab_size) -> (len, b)
+        log_prob = F.log_softmax(predict, dim=-1)
+        log_prob = torch.gather(log_prob,
+                                index=target.unsqueeze(-1),
+                                dim=-1).squeeze(-1) * mask
+        log_prob = log_prob.view(-1)
+        prob = torch.exp(log_prob)
+
+        if self.alpha is not None:
+            if self.alpha.type() != predict.type():
+                print('*** self.alpha.type() ***', self.alpha.type())
+                print('*** predict.type() ***', predict.type())
+                self.alpha = self.alpha.type_as(predict)
+            # TODO, figure it out
+            # not understand yet
+            alpha = self.alpha.gather(0, target.view(-1))
+            log_prob = log_prob * alpha
+
+        loss = (1 - prob) ** self.gamma * log_prob
+
+        loss = loss.view(length, batch_size)
+        if self.size_average:
+            return loss.mean(dim=0)
+        else:
+            return loss.sum(dim=0)
+
+
 class NMT(nn.Module):
     """ Simple Neural Machine Translation Model:
         - Bidirectional LSTM Encoder
@@ -25,7 +81,13 @@ class NMT(nn.Module):
         - Global Attention Model (Luong, et al. 2015)
     """
 
-    def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2):
+    def __init__(self,
+                 embed_size,
+                 hidden_size,
+                 vocab,
+                 dropout_rate=0.2,
+                 loss_type='cross_entropy',
+                 **kwargs):
         """ Init NMT Model.
 
         @param embed_size (int): Embedding size (dimensionality)
@@ -40,18 +102,17 @@ class NMT(nn.Module):
         self.dropout_rate = dropout_rate
         self.vocab = vocab
 
-        # default values
-        self.encoder = None
-        self.decoder = None
-        self.h_projection = None
-        self.c_projection = None
-        self.att_projection = None
-        self.combined_output_projection = None
-        self.target_vocab_projection = None
-        self.dropout = None
+        allow_loss_type = ['cross_entropy', 'focal_loss']
 
-        # YOUR CODE HERE (~8 Lines)
-        # TODO - Initialize the following variables:
+        if loss_type not in allow_loss_type:
+            raise ValueError('loss_type must be one of `%s`, but got `%s`' % (allow_loss_type, loss_type))
+
+        self.loss_type = loss_type
+
+        # init variable for focal loss
+        if self.loss_type == 'focal_loss':
+            self.gamma = kwargs.pop('gamma', 2)
+
         # self.encoder (Bidirectional LSTM with bias)
         # self.decoder (LSTM Cell with bias)
         # self.h_projection (Linear Layer with no bias), called W_{h} in the PDF.
@@ -92,12 +153,70 @@ class NMT(nn.Module):
                                                     bias=False)
         self.target_vocab_projection = nn.Linear(in_features=hidden_size,
                                                  out_features=len(vocab.tgt),
-                                                 bias=False)
+                                                 bias=True)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-        # END YOUR CODE
+    # def forward(self, source: List[List[str]], target: List[List[str]]) -> torch.Tensor:
+    #     """ Take a mini-batch of source and target sentences, compute the log-likelihood of
+    #     target sentences under the language models learned by the NMT system.
+    #
+    #     @param source: (List[List[str]]), list of source sentence tokens
+    #     @param target: (List[List[str]]), list of target sentence tokens, wrapped by `<s>` and `</s>`
+    #
+    #     @returns scores: (Tensor), a variable/tensor of shape (b, ) representing the
+    #                                 log-likelihood of generating the gold-standard target sentence for
+    #                                 each example in the input batch. Here b = batch size.
+    #     """
+    #     # Compute sentence lengths
+    #     source_lengths = [len(s) for s in source]
+    #
+    #     # Convert list of lists into tensors
+    #     source_padded = self.vocab.src.to_input_tensor(
+    #         source, device=self.device)  # Tensor: (src_len, b)
+    #     target_padded = self.vocab.tgt.to_input_tensor(
+    #         target, device=self.device)  # Tensor: (tgt_len, b)
+    #
+    #     # Run the network forward:
+    #     # 1. Apply the encoder to `source_padded` by calling `self.encode()`
+    #     # 2. Generate sentence masks for `source_padded` by calling `self.generate_sent_masks()`
+    #     # 3. Apply the decoder to compute combined-output by calling `self.decode()`
+    #     # 4. Compute log probability distribution over the target vocabulary using the
+    #     # combined_outputs returned by the `self.decode()` function.
+    #
+    #     # 1. Apply the encoder to `source_padded` by calling `self.encode()`
+    #     enc_hiddens, dec_init_state = self.encode(source_padded, source_lengths)
+    #     # 2. Generate sentence masks for `source_padded` by calling `self.generate_sent_masks()`
+    #     enc_masks = self.generate_sent_masks(enc_hiddens, source_lengths)
+    #     # 3. Apply the decoder to compute combined-output by calling `self.decode()`
+    #     combined_outputs = self.decode(enc_hiddens, enc_masks, dec_init_state, target_padded)
+    #     # 4. Compute log probability distribution over the target vocabulary using the
+    #     # combined_outputs: (tgt_len - 1, b, h) -> target_vocab_projection: (tgt_len - 1, b, tgt_vocab_size)
+    #     # -> P: (tgt_len - 1, b, tgt_vocab_size)
+    #     target_vocab_projection = self.target_vocab_projection(combined_outputs)
+    #     P = F.log_softmax(target_vocab_projection, dim=-1)
+    #
+    #     # Zero out, probabilities for which we have nothing in the target text
+    #     # target_padded: (tgt_len, b) -> target_masks: (tgt_len, b)
+    #     target_masks = (target_padded != self.vocab.tgt['<pad>']).float()
+    #
+    #     # Compute log probability of generating true target words
+    #     # P: (tgt_len - 1, b, tgt_vocab_size), index: (tgt_len - 1, b), target_masks: (tgt_len - 1, b)
+    #     # -> target_gold_words_log_prob: (tgt_len - 1, b)
+    #     target_gold_words_log_prob = torch.gather(P,
+    #                                               index=target_padded[1:].unsqueeze(-1),
+    #                                               dim=-1).squeeze(-1) * target_masks[1:]
+    #     #
+    #     # scores: (b,)
+    #     scores = target_gold_words_log_prob.sum(dim=0)
+    #     return scores
+    #
+    #     # target_masks = (target_padded != self.vocab.tgt['<pad>']).float()
+    #     #
+    #     # self.focal_loss.to(self.device)
+    #     # scores = self.focal_loss(target_vocab_projection, target_padded[1:], target_masks[1:])
+    #     # return scores
 
-    def forward(self, source: List[List[str]], target: List[List[str]]) -> torch.Tensor:
+    def forward(self, source: List[List[str]], target: List[List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """ Take a mini-batch of source and target sentences, compute the log-likelihood of
         target sentences under the language models learned by the NMT system.
 
@@ -134,22 +253,77 @@ class NMT(nn.Module):
         # combined_outputs: (tgt_len - 1, b, h) -> target_vocab_projection: (tgt_len - 1, b, tgt_vocab_size)
         # -> P: (tgt_len - 1, b, tgt_vocab_size)
         target_vocab_projection = self.target_vocab_projection(combined_outputs)
-        P = F.log_softmax(target_vocab_projection, dim=-1)
 
-        # Zero out, probabilities for which we have nothing in the target text
-        # target_padded: (tgt_len, b) -> target_masks: (tgt_len, b)
+        # logits: (tgt_len - 1, b, tgt_vocab_size)
+        logits = F.softmax(target_vocab_projection, dim=-1)
+
+        return logits, target_padded
+
+    def compute_loss(self,
+                     logits: torch.Tensor,
+                     target_padded: torch.Tensor):
+        # target_logits: (tgt_len - 1, b, tgt_vocab_size)
+        # target_padded: (tgt_len, b)
+
+        # target_masks: (tgt_len, b)
         target_masks = (target_padded != self.vocab.tgt['<pad>']).float()
+        # P: (tgt_len - 1, b, tgt_vocab_size)
+        P = torch.log(logits)
 
-        # Compute log probability of generating true target words
-        # P: (tgt_len - 1, b, tgt_vocab_size), index: (tgt_len - 1, b), target_masks: (tgt_len - 1, b)
-        # -> target_gold_words_log_prob: (tgt_len - 1, b)
-        target_gold_words_log_prob = torch.gather(P,
-                                                  index=target_padded[1:].unsqueeze(-1),
-                                                  dim=-1).squeeze(-1) * target_masks[1:]
+        if self.loss_type == 'cross_entropy':
+            # loss: (tgt_len - 1, b)
+            loss = -1 * torch.gather(P,
+                                     index=target_padded[1:].unsqueeze(-1),
+                                     dim=-1).squeeze(-1) * target_masks[1:]
+        elif self.loss_type == 'focal_loss':
+            # loss: (tgt_len - 1, b, tgt_vocab_size)
+            loss = -1 * (1 - logits) ** self.gamma * P
+            # loss: (tgt_len - 1, b)
+            loss = torch.gather(loss,
+                                index=target_padded[1:].unsqueeze(-1),
+                                dim=-1).squeeze(-1) * target_masks[1:]
 
-        # scores: (b,)
-        scores = target_gold_words_log_prob.sum(dim=0)
-        return scores
+        batch_size = logits.size(1)
+        loss = torch.sum(loss) / batch_size
+
+        return loss
+
+    def compute_micro_f1(self,
+                         logits: torch.Tensor,
+                         target_padded: torch.Tensor) -> float:
+
+        def sentence_ids_to_multi_ones_hot_vector(y: List[int]) -> np.array:
+            total_length = len(self.vocab.tgt)
+            ones_hot = np.zeros(total_length, dtype=np.int)
+            hot_indices = y
+            ones_hot[hot_indices] = 1
+            return ones_hot
+
+        def sentences_ids_to_multi_ones_hot_vectors(ys: List[List[int]]) -> np.array:
+            return np.array([sentence_ids_to_multi_ones_hot_vector(y) for y in ys],
+                            dtype=np.int)
+
+        # logits: (tgt_len - 1, b, tgt_vocab_size)
+        # target_padded: (tgt_len, b)
+
+        # target_padded: (tgt_len, b) -> (tgt_len - 1, b)
+        target_padded = target_padded[1:]
+
+        # pred: (tgt_len - 1, b)
+        pred = torch.argmax(logits, dim=2)
+
+        # convert to list
+        # target_padded: (tgt_len - 1, b)
+        # (tgt_len - 1, b)
+        target_padded = target_padded.tolist()
+        pred = pred.tolist()
+
+        target_ones_hot_vectors = sentences_ids_to_multi_ones_hot_vectors(target_padded)
+        pred_ones_hot_vectors = sentences_ids_to_multi_ones_hot_vectors(pred)
+
+        micro_f1 = metrics.f1_score(target_ones_hot_vectors, pred_ones_hot_vectors, average='micro')
+
+        return micro_f1
 
     def encode(self,
                source_padded: torch.Tensor,
@@ -628,8 +802,14 @@ class SGM(nn.Module):
         - Attention, Global Embedding
     """
 
-    def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2):
-        """ Init SGM Model.
+    def __init__(self,
+                 embed_size,
+                 hidden_size,
+                 vocab,
+                 dropout_rate=0.2,
+                 loss_type='cross_entropy',
+                 **kwargs):
+        """ Init NMT Model.
 
         @param embed_size (int): Embedding size (dimensionality)
         @param hidden_size (int): Hidden Size (dimensionality)
@@ -642,6 +822,17 @@ class SGM(nn.Module):
         self.hidden_size = hidden_size
         self.dropout_rate = dropout_rate
         self.vocab = vocab
+
+        allow_loss_type = ['cross_entropy', 'focal_loss']
+
+        if loss_type not in allow_loss_type:
+            raise ValueError('loss_type must be one of `%s`, but got `%s`' % (allow_loss_type, loss_type))
+
+        self.loss_type = loss_type
+
+        # init variable for focal loss
+        if self.loss_type == 'focal_loss':
+            self.gamma = kwargs.pop('gamma', 2)
 
         # self.encoder (Bidirectional LSTM with bias)
         # self.h_projection, not mentioned in paper
@@ -704,7 +895,7 @@ class SGM(nn.Module):
                                                  bias=False)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward(self, source: List[List[str]], target: List[List[str]]) -> torch.Tensor:
+    def forward(self, source: List[List[str]], target: List[List[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """ Take a mini-batch of source and target sentences, compute the log-likelihood of
         target sentences under the language models learned by the NMT system.
 
@@ -741,22 +932,76 @@ class SGM(nn.Module):
         # combined_outputs: (tgt_len - 1, b, h) -> target_vocab_projection: (tgt_len - 1, b, tgt_vocab_size)
         # -> P: (tgt_len - 1, b, tgt_vocab_size)
         target_vocab_projection = self.target_vocab_projection(combined_outputs)
-        P = F.log_softmax(target_vocab_projection, dim=-1)
+        # logits: (tgt_len - 1, b, tgt_vocab_size)
+        logits = F.softmax(target_vocab_projection, dim=-1)
 
-        # Zero out, probabilities for which we have nothing in the target text
-        # target_padded: (tgt_len, b) -> target_masks: (tgt_len, b)
+        return logits, target_padded
+
+    def compute_loss(self,
+                     logits: torch.Tensor,
+                     target_padded: torch.Tensor):
+        # target_logits: (tgt_len - 1, b, tgt_vocab_size)
+        # target_padded: (tgt_len, b)
+
+        # target_masks: (tgt_len, b)
         target_masks = (target_padded != self.vocab.tgt['<pad>']).float()
+        # P: (tgt_len - 1, b, tgt_vocab_size)
+        P = torch.log(logits)
 
-        # Compute log probability of generating true target words
-        # P: (tgt_len - 1, b, tgt_vocab_size), index: (tgt_len - 1, b), target_masks: (tgt_len - 1, b)
-        # -> target_gold_words_log_prob: (tgt_len - 1, b)
-        target_gold_words_log_prob = torch.gather(P,
-                                                  index=target_padded[1:].unsqueeze(-1),
-                                                  dim=-1).squeeze(-1) * target_masks[1:]
+        if self.loss_type == 'cross_entropy':
+            # loss: (tgt_len - 1, b)
+            loss = -1 * torch.gather(P,
+                                     index=target_padded[1:].unsqueeze(-1),
+                                     dim=-1).squeeze(-1) * target_masks[1:]
+        elif self.loss_type == 'focal_loss':
+            # loss: (tgt_len - 1, b, tgt_vocab_size)
+            loss = -1 * (1 - logits) ** self.gamma * P
+            # loss: (tgt_len - 1, b)
+            loss = torch.gather(loss,
+                                index=target_padded[1:].unsqueeze(-1),
+                                dim=-1).squeeze(-1) * target_masks[1:]
 
-        # scores: (b,)
-        scores = target_gold_words_log_prob.sum(dim=0)
-        return scores
+        batch_size = logits.size(1)
+        loss = torch.sum(loss) / batch_size
+
+        return loss
+
+    def compute_micro_f1(self,
+                         logits: torch.Tensor,
+                         target_padded: torch.Tensor) -> float:
+
+        def sentence_ids_to_multi_ones_hot_vector(y: List[int]) -> np.array:
+            total_length = len(self.vocab.tgt)
+            ones_hot = np.zeros(total_length, dtype=np.int)
+            hot_indices = y
+            ones_hot[hot_indices] = 1
+            return ones_hot
+
+        def sentences_ids_to_multi_ones_hot_vectors(ys: List[List[int]]) -> np.array:
+            return np.array([sentence_ids_to_multi_ones_hot_vector(y) for y in ys],
+                            dtype=np.int)
+
+        # logits: (tgt_len - 1, b, tgt_vocab_size)
+        # target_padded: (tgt_len, b)
+
+        # target_padded: (tgt_len, b) -> (tgt_len - 1, b)
+        target_padded = target_padded[1:]
+
+        # pred: (tgt_len - 1, b)
+        pred = torch.argmax(logits, dim=2)
+
+        # convert to list
+        # target_padded: (tgt_len - 1, b)
+        # (tgt_len - 1, b)
+        target_padded = target_padded.tolist()
+        pred = pred.tolist()
+
+        target_ones_hot_vectors = sentences_ids_to_multi_ones_hot_vectors(target_padded)
+        pred_ones_hot_vectors = sentences_ids_to_multi_ones_hot_vectors(pred)
+
+        micro_f1 = metrics.f1_score(target_ones_hot_vectors, pred_ones_hot_vectors, average='micro')
+
+        return micro_f1
 
     def encode(self,
                source_padded: torch.Tensor,
@@ -922,7 +1167,7 @@ class SGM(nn.Module):
             # dec_state: ((b, h), (b, h))
             # combined_output: (b, h)
             dec_state, combined_output, c_t, _ = self.step(Ybar_t, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
-            transform_gate = self.transform_gate(combined_output)
+            transform_gate = torch.sigmoid(self.transform_gate(combined_output))
             combined_output = transform_gate * combined_output + (1 - transform_gate) * combined_output_prev
             combined_outputs.append(combined_output)
             c_prev = c_t
@@ -1117,7 +1362,7 @@ class SGM(nn.Module):
             (h_t, cell_t), att_t, c_t, _ = self.step(x, h_tm1,
                                                      exp_src_encodings, exp_src_encodings_att_linear, enc_masks=None)
 
-            transform_gate = self.transform_gate(att_t)
+            transform_gate = torch.sigmoid(self.transform_gate(att_t))
             att_t = transform_gate * att_t + (1 - transform_gate) * att_t_prev
 
             # log probabilities over target words

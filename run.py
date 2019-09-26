@@ -53,13 +53,15 @@ from vocab import Vocab, VocabEntry
 import torch
 import torch.nn.utils
 
+from utils import Averager, Timer
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='run.py for training, evaluating model')
 
-    parser.add_argument('-model_name', default='SGM', type=str,
+    parser.add_argument('-model_name', default='NMT', type=str,
                         help="choose the model by name")
-    parser.add_argument('-dataset_name', default='AAPD', type=str,
+    parser.add_argument('-dataset_name', default='RCV1-V2', type=str,
                         help="choose the dataset by name")
 
     parser.add_argument('-mode', default='test', type=str,
@@ -98,14 +100,16 @@ def parse_args():
                         help="gradient clipping, default: 5.0")
     parser.add_argument('-log_every', default=10, type=int,
                         help="log_every, default 10")
-    parser.add_argument('-max_epoch', default=30, type=int,
-                        help="max_epoch, default 30")
+    parser.add_argument('-max_epoch', default=20, type=int,
+                        help="max_epoch, default 20")
     parser.add_argument('-patience', default=5, type=int,
                         help="wait for how many iterations to decay learning rate default: 5")
     parser.add_argument('-max_num_trial', default=5, type=int,
                         help="terminate training after how many trials, default 5")
     parser.add_argument('-lr_decay', default=0.5, type=float,
                         help="lr_decay, default 0.5")
+    parser.add_argument('-lr_decay_step', default=10, type=int,
+                        help="lr_decay, default 10")
     parser.add_argument('-beam_size', default=5, type=int,
                         help="beam_size, default 5")
     parser.add_argument('-lr', default=0.001, type=float,
@@ -116,8 +120,10 @@ def parse_args():
                         help="model save path, default ./checkpoints/model.bin")
     parser.add_argument('-valid_niter', default=2000, type=int,
                         help="perform validation after how many iterations, default: 2000")
-    parser.add_argument('-dropout', default=0.3, type=float,
-                        help="dropout, default 0.3")
+    parser.add_argument('-print_best_epoch', default=5, type=int,
+                        help="print best metric result every print_best_epoch epoch, default: 5")
+    parser.add_argument('-dropout', default=0.5, type=float,
+                        help="dropout, default 0.5")
     parser.add_argument('-max_decoding_time_step', default=70, type=int,
                         help="max_decoding_time_step, default 70")
 
@@ -125,6 +131,35 @@ def parse_args():
 
     return arguments
 
+
+# def evaluate_ppl(model, dev_data, batch_size=32):
+#     """ Evaluate perplexity on dev sentences
+#     @param model: (NMT), NMT Model
+#     @param dev_data: (list of (src_sent, tgt_sent)), list of tuples containing source and target sentence
+#     @param batch_size (batch size)
+#     @returns ppl (perplexity on dev sentences)
+#     """
+#     was_training = model.training
+#     model.eval()
+#
+#     cum_loss = 0.
+#     cum_tgt_words = 0.
+#
+#     # no_grad() signals backend to throw away all gradients
+#     with torch.no_grad():
+#         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
+#             loss = -model(src_sents, tgt_sents).sum()
+#
+#             cum_loss += loss.item()
+#             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
+#             cum_tgt_words += tgt_word_num_to_predict
+#
+#         ppl = np.exp(cum_loss / cum_tgt_words)
+#
+#     if was_training:
+#         model.train()
+#
+#     return ppl
 
 def evaluate_ppl(model, dev_data, batch_size=32):
     """ Evaluate perplexity on dev sentences
@@ -142,8 +177,8 @@ def evaluate_ppl(model, dev_data, batch_size=32):
     # no_grad() signals backend to throw away all gradients
     with torch.no_grad():
         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = -model(src_sents, tgt_sents).sum()
-
+            logits, target_padded = model(src_sents, tgt_sents)
+            loss = model.compute_loss(logits, target_padded)
             cum_loss += loss.item()
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
             cum_tgt_words += tgt_word_num_to_predict
@@ -169,9 +204,9 @@ def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: Lis
     return bleu_score
 
 
-def compute_hamming_loss(references: List[List[str]],
-                         hypotheses: List[Hypothesis],
-                         tgt_dictionary: VocabEntry) -> Dict[str, float]:
+def compute_metrics(references: List[List[str]],
+                    hypotheses: List[Hypothesis],
+                    tgt_dictionary: VocabEntry) -> Dict[str, float]:
     """ Given decoding results and reference sentences, compute corpus-level BLEU score.
     @param references: (List[List[str]]), a list of gold-standard reference target sentences (or labels)
     @param hypotheses: (List[Hypothesis]), a list of hypotheses, one for each reference
@@ -252,8 +287,8 @@ def train(args):
             p.data.uniform_(-uniform_init, uniform_init)
 
     # seem to be useless
-    # vocab_mask = torch.ones(len(vocab.tgt))
-    # vocab_mask[vocab.tgt['<pad>']] = 0
+    vocab_mask = torch.ones(len(vocab.tgt))
+    vocab_mask[vocab.tgt['<pad>']] = 0
 
     device = torch.device("cuda:%d" % args.cuda if args.cuda >= 0 else "cpu")
     print('use device: %s' % device, file=sys.stderr)
@@ -279,9 +314,9 @@ def train(args):
 
             batch_size = len(src_sents)
 
-            example_losses = -model(src_sents, tgt_sents)  # (batch_size,)
-            batch_loss = example_losses.sum()
-            loss = batch_loss / batch_size
+            logits, target_padded = model(src_sents, tgt_sents)
+            loss = model.compute_loss(logits, target_padded)
+            batch_loss = loss * batch_size
 
             loss.backward()
 
@@ -386,6 +421,153 @@ def train(args):
                     exit(0)
 
 
+# def train(args):
+#     """ Train the NMT Model.
+#     @param args, args from cmd line
+#     """
+#     model_name = args.model_name
+#     dataset_name = args.dataset_name
+#     train_data_src = read_corpus(args.train_src % dataset_name, source='src')
+#     train_data_tgt = read_corpus(args.train_tgt % dataset_name, source='tgt')
+#
+#     dev_data_src = read_corpus(args.dev_src % dataset_name, source='src')
+#     dev_data_tgt = read_corpus(args.dev_tgt % dataset_name, source='tgt')
+#
+#     train_data = list(zip(train_data_src, train_data_tgt))
+#     dev_data = list(zip(dev_data_src, dev_data_tgt))
+#
+#     train_batch_size = args.batch_size
+#     clip_grad = args.clip_grad
+#
+#     model_save_path = args.save_to % (model_name, dataset_name)
+#
+#     vocab = Vocab.load(args.vocab % dataset_name)
+#
+#     model = get_model(model_name)(embed_size=args.embed_size,
+#                                   hidden_size=args.hidden_size,
+#                                   dropout_rate=args.dropout,
+#                                   vocab=vocab)
+#
+#     uniform_init = args.uniform_init
+#     if np.abs(uniform_init) > 0.:
+#         print('uniformly initialize parameters [-%f, +%f]' % (uniform_init, uniform_init), file=sys.stderr)
+#         for p in model.parameters():
+#             p.data.uniform_(-uniform_init, uniform_init)
+#
+#     # seem to be useless
+#     vocab_mask = torch.ones(len(vocab.tgt))
+#     vocab_mask[vocab.tgt['<pad>']] = 0
+#
+#     device = torch.device("cuda:%d" % args.cuda if args.cuda >= 0 else "cpu")
+#     print('use device: %s' % device, file=sys.stderr)
+#
+#     model = model.to(device)
+#
+#     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+#
+#     print('begin Maximum Likelihood training')
+#
+#     # Set the meta-train log
+#     train_log = {
+#         'train_loss': [], 'val_loss': [],
+#         'train_micro_f1': [], 'val_micro_f1': [],
+#         'max_micro_f1': 0.0, 'max_micro_f1_epoch': 0,
+#     }
+#
+#     # Set the timer
+#     timer = Timer()
+#
+#     for epoch in range(1, args.max_epoch + 1):
+#
+#         # init averagers
+#         train_loss_averager = Averager()
+#         train_micro_f1_averager = Averager()
+#         # set to train mode
+#         model.train()
+#
+#         tqdm_train_gen = tqdm(batch_iter(train_data, batch_size=train_batch_size, shuffle=True))
+#         for i, batch in enumerate(tqdm_train_gen, 1):
+#             src_sents, tgt_sents = batch[0], batch[1]
+#
+#             # get loss, micro_f1
+#             logits, target_padded = model(src_sents, tgt_sents)
+#             loss = model.compute_loss(logits, target_padded)
+#             micro_f1 = model.compute_micro_f1(logits, target_padded)
+#
+#             # set description
+#             tqdm_train_gen.set_description(
+#                 'Mode=Train | Epoch={} | Loss={:.4f} | Micro_f1={:.4f}'.format(epoch, loss.item(), micro_f1))
+#             train_loss_averager.add(loss.item())
+#             train_micro_f1_averager.add(micro_f1)
+#
+#             # update parameters
+#             optimizer.zero_grad()
+#             loss.backward()
+#             # clip norm
+#             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+#             optimizer.step()
+#
+#         # print best result
+#         if epoch % args.print_best_epoch == 0:
+#             print('Mode=Train | Best_epoch={} | Best_val_micro_f1={:.4f}'.format(train_log['max_micro_f1_epoch'],
+#                                                                                  train_log['max_micro_f1']))
+#
+#         # Update training averagers
+#         train_loss_averager = train_loss_averager.item()
+#         train_micro_f1_averager = train_micro_f1_averager.item()
+#
+#         # init averager
+#         val_loss_averager = Averager()
+#         val_micro_f1_averager = Averager()
+#         # set to eval mode
+#         model.eval()
+#
+#         tqdm_val_gen = tqdm(batch_iter(dev_data, batch_size=128))
+#         for i, batch in enumerate(tqdm_val_gen, 1):
+#             src_sents, tgt_sents = batch[0], batch[1]
+#
+#             with torch.no_grad():
+#                 # get loss, micro_f1
+#                 logits, target_padded = model(src_sents, tgt_sents)
+#                 loss = model.compute_loss(logits, target_padded)
+#                 micro_f1 = model.compute_micro_f1(logits, target_padded)
+#
+#                 # set description
+#                 tqdm_val_gen.set_description(
+#                     'Mode=Eval  | Epoch={} | Loss={:.4f} | Micro_f1={:.4f}'.format(epoch, loss.item(), micro_f1))
+#
+#             val_loss_averager.add(loss.item())
+#             val_micro_f1_averager.add(micro_f1)
+#
+#         # Update validation averagers
+#         val_loss_averager = val_loss_averager.item()
+#         val_micro_f1_averager = val_micro_f1_averager.item()
+#
+#         # Update best saved model
+#         if val_micro_f1_averager > train_log['max_micro_f1']:
+#             train_log['max_micro_f1'] = val_micro_f1_averager
+#             train_log['max_micro_f1_epoch'] = epoch
+#             model.save(model_save_path + 'best_model.bin')
+#         # Save model every 5 epochs
+#         if epoch % 5 == 0:
+#             model.save(model_save_path + 'epoch%s_model.bin' % str(epoch))
+#
+#         # Update the logs
+#         train_log['train_loss'].append(train_loss_averager)
+#         train_log['train_micro_f1'].append(train_micro_f1_averager)
+#         train_log['val_loss'].append(val_loss_averager)
+#         train_log['val_micro_f1'].append(val_micro_f1_averager)
+#
+#         if epoch % 5 == 0:
+#             print('Running_time={} | Estimated_time={}'.format(timer.measure(), timer.measure(epoch / args.max_epoch)))
+#
+#         if epoch % args.lr_decay_step == 0:
+#             lr = optimizer.param_groups[0]['lr'] * args.lr_decay
+#             # set new lr
+#             for param_group in optimizer.param_groups:
+#                 param_group['lr'] = lr
+
+
 def decode(args):
     """ Performs decoding on a test set, and save the best-scoring decoding results.
     If the target gold-standard sentences are given, the function also computes
@@ -402,8 +584,9 @@ def decode(args):
         print("load test target sentences from [{}]".format(args.test_tgt % dataset_name), file=sys.stderr)
         test_data_tgt = read_corpus(args.test_tgt % dataset_name, source='tgt')
 
-    print("load model from {}".format(args.save_to % (model_name, dataset_name)), file=sys.stderr)
-    model = get_model(model_name).load(args.save_to % (model_name, dataset_name))
+    model_load_path = args.save_to % (model_name, dataset_name)
+    print("load model from [%s]" % model_load_path, file=sys.stderr)
+    model = get_model(model_name).load(model_load_path)
 
     if args.cuda >= 0:
         model = model.to(torch.device("cuda:%d" % args.cuda))
@@ -415,7 +598,7 @@ def decode(args):
     if args.test_tgt:
         top_hypotheses = [hyps[0] for hyps in hypotheses]
         bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
-        results = compute_hamming_loss(test_data_tgt, top_hypotheses, model.vocab.tgt)
+        results = compute_metrics(test_data_tgt, top_hypotheses, model.vocab.tgt)
         print('Corpus BLEU: {}'.format(bleu_score * 100), file=sys.stderr)
         for result, val in results.items():
             print('%s: %.4f' % (result, val), file=sys.stderr)

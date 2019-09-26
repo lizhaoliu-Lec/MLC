@@ -118,6 +118,8 @@ class VocabEntry(object):
         @param sents: (list[str] or list[list[str]]), sentence(s) in words
         @return word_ids (list[int] or list[list[int]]): sentence(s) in indices
         """
+        if not sents:
+            return []
         if type(sents[0]) == list:
             return [[self[w] for w in s] for s in sents]
         elif type(sents[0]) == str:
